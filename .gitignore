@@ -1,0 +1,7 @@
+# Workspaces
+/.vs
+
+# Build files. Must be published in Releases
+/build*
+/cmake-build*
+/external/

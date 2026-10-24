@@ -1,0 +1,2284 @@
+/**
+ * vim: set ts=4 sw=4 tw=99 noet :
+ * ======================================================
+ * Metamod:Source {project}
+ * Written by {name of author} ({fullname}).
+ * ======================================================
+
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include <sample_plugin.hpp>
+#include <globals.hpp>
+
+#include <stdint.h>
+
+#include <string>
+#include <exception>
+
+#include <any_config.hpp>
+#include <concat.hpp>
+
+#include <metamod_khook.h>
+#include <memory>
+
+#include <filesystem.h>
+#include <igameeventsystem.h>
+#include <inetchannel.h>
+#include <networksystem/inetworkmessages.h>
+#include <networksystem/inetworkserializer.h>
+#include <recipientfilter.h>
+#include <serversideclient.h>
+#include <shareddefs.h>
+#include <tier0/commonmacros.h>
+#include <tier0/icommandline.h>
+#include <usermessages.pb.h>
+#include <connectionless_netmessages.pb.h>
+
+#include <netmessages.h>
+#include <usermessages.h>
+
+auto _khook = std::unique_ptr<KHookImpl>();
+_khook->Setup
+
+static Sample_Plugin s_aSamplePlugin;
+Sample_Plugin *g_pSamplePlugin = &s_aSamplePlugin;
+
+PLUGIN_EXPOSE(Sample_Plugin, s_aSamplePlugin);
+
+Sample_Plugin::Sample_Plugin()
+ :  CLogger(GetName(), [](LoggingChannelID_t nTagChannelID)
+    {
+    	LoggingSystem_AddTagToChannel(nTagChannelID, s_aSamplePlugin.GetLogTag());
+    }, 0, LV_DETAILED, SAMPLE_LOGGINING_COLOR),
+
+    m_aEnableFrameDetailsConVar("mm_" META_PLUGIN_PREFIX "_enable_frame_details", FCVAR_RELEASE | FCVAR_GAMEDLL, "Enable detail messages of frames", false, true, false, true, true), 
+    m_aEnableGameEventsDetaillsConVar("mm_" META_PLUGIN_PREFIX "_enable_game_events_details", FCVAR_RELEASE | FCVAR_GAMEDLL, "Enable detail messages of game events", false, true, false, true, true),
+    m_mapConVarCookies(DefLessFunc(const CUtlSymbolLarge)),
+    m_mapLanguages(DefLessFunc(const CUtlSymbolLarge)),
+
+    m_pFactory(NULL),
+
+    m_pGetCvarValueMessage(NULL),
+    m_pSayText2Message(NULL),
+    m_pTextMsgMessage(NULL)
+{
+	// Register chat commands.
+	Sample::ChatCommandSystem::Register("sample", {[&](CPlayerSlot aSlot, bool bIsSilent, const CUtlVector<CUtlString> &vecArguments)
+	{
+		CSingleRecipientFilter aFilter(aSlot);
+
+		const auto &aPlayer = GetPlayerData(aSlot);
+
+		if(!aPlayer.IsConnected())
+		{
+			return;
+		}
+
+		const auto &aPhrase = aPlayer.GetYourArgumentPhrase();
+
+		if(aPhrase.m_pFormat && aPhrase.m_pContent)
+		{
+			for(const auto &sArgument : vecArguments)
+			{
+				SendTextMessage(&aFilter, HUD_PRINTTALK, 1, aPhrase.m_pContent->Format(*aPhrase.m_pFormat, 1, sArgument.Get()).Get());
+			}
+		}
+		else
+		{
+			CLogger::Warning("Not found a your argument phrase\n");
+		}
+	}});
+}
+
+bool Sample_Plugin::Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen, bool late)
+{
+	PLUGIN_SAVEVARS();
+
+	CLogger::MessageFormat("Starting %s plugin...\n", GetName());
+
+	if(!InitGlobals(ismm, error, maxlen))
+	{
+		return false;
+	}
+
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		DumpGlobals(CConcatLineBuffer(&g_aEmbedConcat, &sBuffer));
+		CLogger::Detailed(sBuffer);
+	}
+
+	ConVar_Register(FCVAR_RELEASE | FCVAR_GAMEDLL);
+
+	if(!InitPathResolver(error, maxlen))
+	{
+		return false;
+	}
+
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append("Path resolver");
+		CConcatLineBuffer(&g_aEmbedConcat, &sBuffer).Append<false, true>("Base game directory", m_sBaseGameDirectory.c_str());
+		CLogger::Detailed(sBuffer);
+	}
+
+	if(!InitProvider(error, maxlen))
+	{
+		return false;
+	}
+
+	if(!LoadProvider(error, maxlen))
+	{
+		return false;
+	}
+
+	if(!ParseLanguages(error, maxlen))
+	{
+		return false;
+	}
+
+	if(!ParseTranslations(error, maxlen))
+	{
+		return false;
+	}
+
+	if(!RegisterGameFactory(error, maxlen))
+	{
+		return false;
+	}
+
+	ParseGameEvents();
+
+	SH_ADD_HOOK(ICvar, DispatchConCommand, g_pCVar, SH_MEMBER(this, &Sample_Plugin::OnDispatchConCommandHook), false);
+	SH_ADD_HOOK_MEMFUNC(INetworkServerService, StartupServer, g_pNetworkServerService, this, &Sample_Plugin::OnStartupServerHook, true);
+
+	if(late)
+	{
+		auto *pNetServer = reinterpret_cast<CNetworkGameServerBase *>(g_pNetworkServerService->GetIGameServer());
+
+		if(pNetServer)
+		{
+			OnStartupServer(pNetServer, pNetServer->m_GameConfig, NULL);
+
+			for(const auto &pClient : pNetServer->m_Clients)
+			{
+				if(pClient->IsConnected() && !pClient->IsFakeClient())
+				{
+					OnConnectClient(pNetServer, pClient);
+				}
+			}
+		}
+	}
+
+	ismm->AddListener(static_cast<ISmmPlugin *>(this), static_cast<IMetamodListener *>(this));
+
+	// Print CPU information.
+	{
+		CMassiveBufferString sBuffer;
+
+		GetCPUInformation().GetDescription(&sBuffer, CPUInformation::CPUDESC_ALL);
+		CLogger::Message(sBuffer);
+	}
+
+	CLogger::MessageFormat("%s started!\n", GetName());
+
+	return true;
+}
+
+bool Sample_Plugin::Unload(char *error, size_t maxlen)
+{
+	{
+		auto *pNetServer = reinterpret_cast<CNetworkGameServerBase *>(g_pNetworkServerService->GetIGameServer());
+
+		if(pNetServer)
+		{
+			SH_REMOVE_HOOK_MEMFUNC(CNetworkGameServerBase, ConnectClient, pNetServer, this, &Sample_Plugin::OnConnectClientHook, true);
+		}
+	}
+
+	SH_REMOVE_HOOK_MEMFUNC(INetworkServerService, StartupServer, g_pNetworkServerService, this, &Sample_Plugin::OnStartupServerHook, true);
+
+	UnhookGameEvents();
+	ClearGameEvents();
+
+	if(!ClearLanguages(error, maxlen))
+	{
+		return false;
+	}
+
+	if(!ClearTranslations(error, maxlen))
+	{
+		return false;
+	}
+
+	if(!UnloadProvider(error, maxlen))
+	{
+		return false;
+	}
+
+	if(!UnregisterNetMessages(error, maxlen))
+	{
+		return false;
+	}
+
+	if(!UnregisterSource2Server(error, maxlen))
+	{
+		return false;
+	}
+
+	if(!UnregisterGameFactory(error, maxlen))
+	{
+		return false;
+	}
+
+	if(!UnregisterGameResource(error, maxlen))
+	{
+		return false;
+	}
+
+	if(!DestoryGlobals(error, maxlen))
+	{
+		return false;
+	}
+
+	if(!ClearPathResolver(error, maxlen))
+	{
+		return false;
+	}
+
+	ConVar_Unregister();
+
+	// ...
+
+	return true;
+}
+
+bool Sample_Plugin::Pause(char *error, size_t maxlen)
+{
+	return true;
+}
+
+bool Sample_Plugin::Unpause(char *error, size_t maxlen)
+{
+	return true;
+}
+
+void Sample_Plugin::AllPluginsLoaded()
+{
+	/**
+	 * AMNOTE: This is where we'd do stuff that relies on the mod or other plugins 
+	 * being initialized (for example, cvars added and events registered).
+	 */
+}
+
+const char *Sample_Plugin::GetAuthor()          { return META_PLUGIN_AUTHOR; }
+const char *Sample_Plugin::GetName()            { return META_PLUGIN_NAME; }
+const char *Sample_Plugin::GetDescription()     { return META_PLUGIN_DESCRIPTION; }
+const char *Sample_Plugin::GetURL()             { return META_PLUGIN_URL; }
+const char *Sample_Plugin::GetLicense()         { return META_PLUGIN_LICENSE; }
+const char *Sample_Plugin::GetVersion()         { return META_PLUGIN_VERSION; }
+const char *Sample_Plugin::GetDate()            { return META_PLUGIN_DATE; }
+const char *Sample_Plugin::GetLogTag()          { return META_PLUGIN_LOG_TAG; }
+
+void *Sample_Plugin::OnMetamodQuery(const char *iface, int *ret)
+{
+	if(!strcmp(iface, SAMPLE_INTERFACE_NAME))
+	{
+		if(ret)
+		{
+			*ret = META_IFACE_OK;
+		}
+
+		return static_cast<ISample *>(this);
+	}
+
+	if(ret)
+	{
+		*ret = META_IFACE_FAILED;
+	}
+
+	return nullptr;
+}
+
+CGameEntitySystem **Sample_Plugin::GetGameEntitySystemPointer() const
+{
+	return reinterpret_cast<CGameEntitySystem **>(reinterpret_cast<uintptr_t>(g_pGameResourceServiceServer) + GetGameDataStorage().GetGameResource().GetEntitySystemOffset());
+}
+
+CBaseGameSystemFactory **Sample_Plugin::GetFirstGameSystemPointer() const
+{
+	return GetGameDataStorage().GetGameSystem().GetFirstPointer();
+}
+
+CUtlStringMap<IGameSystem::FactoryInfo_t> *Sample_Plugin::GetGameSystemFactoriesPointer() const
+{
+	return GetGameDataStorage().GetGameSystem().GetFactories();
+}
+
+CUtlVector<AddedGameSystem_t> *Sample_Plugin::GetGameSystemsPointer() const
+{
+	return GetGameDataStorage().GetGameSystem().GetList();
+}
+
+CGameSystemEventDispatcher **Sample_Plugin::GetGameSystemEventDispatcherPointer() const
+{
+	return GetGameDataStorage().GetGameSystem().GetEventDispatcher();
+}
+
+IGameEventManager2 **Sample_Plugin::GetGameEventManagerPointer() const
+{
+	return reinterpret_cast<IGameEventManager2 **>(GetGameDataStorage().GetSource2Server().GetGameEventManagerPointer());
+}
+
+const ISample::ILanguage *Sample_Plugin::GetLanguageByName(const char *psz) const
+{
+	auto iFound = m_mapLanguages.Find(FindLanguageSymbol(psz));
+
+	return m_mapLanguages.IsValidIndex(iFound) ? &m_mapLanguages.Element(iFound) : nullptr;
+}
+
+ISample::IPlayerBase *Sample_Plugin::GetPlayerBase(const CPlayerSlot &aSlot)
+{
+	return &GetPlayerData(aSlot);
+}
+
+Sample_Plugin::CPlayerBase &Sample_Plugin::GetPlayerData(const CPlayerSlot &aSlot)
+{
+	int iSlot = aSlot.Get();
+
+	Assert(0 <= iSlot && iSlot < sizeof(m_aPlayers));
+
+	return m_aPlayers[iSlot];
+}
+
+bool Sample_Plugin::Init()
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CLogger::DetailedFormat("%s\n", __FUNCTION__);
+	}
+
+	return true;
+}
+
+void Sample_Plugin::PostInit()
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CLogger::DetailedFormat("%s\n", __FUNCTION__);
+	}
+}
+
+void Sample_Plugin::Shutdown()
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CLogger::DetailedFormat("%s\n", __FUNCTION__);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, GameInit)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			aConcat.Append("Config", DumpProtobufMessage(&g_aEmbed2Concat, *msg.m_pConfig).Get());
+			aConcat.Append("Registry", msg.m_pRegistry);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, GameShutdown)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CLogger::DetailedFormat("%s\n", __FUNCTION__);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, GamePostInit)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer), 
+			                        aConcat2(&g_aEmbed2Concat, &sBuffer);
+
+			aConcat.Append("Config", DumpProtobufMessage(&g_aEmbed2Concat, *msg.m_pConfig).Get());
+			aConcat.Append("Registry", msg.m_pRegistry);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, GamePreShutdown)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CLogger::DetailedFormat("%s\n", __FUNCTION__);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, BuildGameSessionManifest)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			aConcat.Append("Resource manifest", msg.m_pResourceManifest);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, GameActivate)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer), 
+			                        aConcat2(&g_aEmbed2Concat, &sBuffer);
+
+			aConcat.Append("Event loop");
+			DumpEngineLoopState(aConcat2, *msg.m_pState);
+			aConcat.Append("Back ground map", msg.m_bBackgroundMap);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+
+	// Initialize a game resource.
+	{
+		char sBuffer[256];
+
+		if(!RegisterGameResource(sBuffer, sizeof(sBuffer)))
+		{
+			CLogger::WarningFormat("%s\n", sBuffer);
+		}
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, ClientFullySignedOn)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CLogger::DetailedFormat("%s\n", __FUNCTION__);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, Disconnect)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CLogger::DetailedFormat("%s\n", __FUNCTION__);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, GameDeactivate)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer), 
+			                        aConcat2(&g_aEmbed2Concat, &sBuffer);
+
+			aConcat.Append("Event loop");
+			DumpEngineLoopState(aConcat2, *msg.m_pState);
+			aConcat.Append("Back ground map", msg.m_bBackgroundMap);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, SpawnGroupPrecache)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			aConcat.Append<false, true>("Spawn group name", msg.m_SpawnGroupName.String());
+			aConcat.Append<false, true>("Entity lump name", msg.m_EntityLumpName.String());
+			aConcat.Append("Spawn group handle", static_cast<uint32>(msg.m_SpawnGroupHandle));
+			aConcat.Append("Entity count", msg.m_nEntityCount);
+			aConcat.Append("Entities to spawn", msg.m_pEntitiesToSpawn);
+			aConcat.Append("Registry", msg.m_pRegistry);
+			aConcat.Append("Manifest", msg.m_pManifest);
+			aConcat.Append("Config", msg.m_pConfig);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, SpawnGroupUncache)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+
+			aConcat.Append<false, true>("Spawn group name", msg.m_SpawnGroupName.String());
+			aConcat.Append<false, true>("Entity lump name", msg.m_EntityLumpName.String());
+			aConcat.Append("Spawn group handle", static_cast<uint32>(msg.m_SpawnGroupHandle));
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, PreSpawnGroupLoad)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			aConcat.Append<false, true>("Spawn group name", msg.m_SpawnGroupName.String());
+			aConcat.Append<false, true>("Entity lump name", msg.m_EntityLumpName.String());
+			aConcat.Append("Spawn group handle", static_cast<uint32>(msg.m_SpawnGroupHandle));
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, PostSpawnGroupLoad)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer), 
+			                        aConcat2(&g_aEmbed2Concat, &sBuffer);
+
+			aConcat.Append<false, true>("Spawn group name", msg.m_SpawnGroupName.String());
+			aConcat.Append<false, true>("Entity lump name", msg.m_EntityLumpName.String());
+			aConcat.Append("Spawn group handle", static_cast<uint32>(msg.m_SpawnGroupHandle));
+			aConcat.Append("Entity list");
+			DumpEntityList(aConcat2, msg.m_EntityList);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, PreSpawnGroupUnload)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer), 
+			                        aConcat2(&g_aEmbed2Concat, &sBuffer);
+
+			aConcat.Append<false, true>("Spawn group name", msg.m_SpawnGroupName.String());
+			aConcat.Append<false, true>("Entity lump name", msg.m_EntityLumpName.String());
+			aConcat.Append("Spawn group handle", static_cast<uint32>(msg.m_SpawnGroupHandle));
+			aConcat.Append("Entity list");
+			DumpEntityList(aConcat2, msg.m_EntityList);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, PostSpawnGroupUnload)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			CMassiveBufferString sBuffer;
+
+			aConcat.Append<false, true>("Spawn group name", msg.m_SpawnGroupName.String());
+			aConcat.Append<false, true>("Entity lump name", msg.m_EntityLumpName.String());
+			aConcat.Append("Spawn group handle", static_cast<uint32>(msg.m_SpawnGroupHandle));
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, ActiveSpawnGroupChanged)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			CMassiveBufferString sBuffer;
+
+			aConcat.Append("Spawn group handle", static_cast<uint32>(msg.m_SpawnGroupHandle));
+			aConcat.Append<false, true>("Spawn group name", msg.m_SpawnGroupName.String());
+			aConcat.Append("Previous handle", msg.m_PreviousHandle);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, ClientPostDataUpdate)
+{
+	if(m_aEnableFrameDetailsConVar.Get() && CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CLogger::DetailedFormat("%s\n", __FUNCTION__);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, ClientPreRender)
+{
+	if(m_aEnableFrameDetailsConVar.Get() && CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			aConcat.Append("Frame time", msg.m_flFrameTime);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, ClientPreEntityThink)
+{
+	if(m_aEnableFrameDetailsConVar.Get() && CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			aConcat.Append("First tick", msg.m_bFirstTick);
+			aConcat.Append("Last tick", msg.m_bLastTick);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, ClientUpdate)
+{
+	if(m_aEnableFrameDetailsConVar.Get() && CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			aConcat.Append("Frame time", msg.m_flFrameTime);
+			aConcat.Append("First tick", msg.m_bFirstTick);
+			aConcat.Append("Last tick", msg.m_bLastTick);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, ClientPostRender)
+{
+	if(m_aEnableFrameDetailsConVar.Get() && CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CLogger::DetailedFormat("%s\n", __FUNCTION__);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, ServerPreEntityThink)
+{
+	if(m_aEnableFrameDetailsConVar.Get() && CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			aConcat.Append("First tick", msg.m_bFirstTick);
+			aConcat.Append("Last tick", msg.m_bLastTick);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, ServerPostEntityThink)
+{
+	if(m_aEnableFrameDetailsConVar.Get() && CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			aConcat.Append("First tick", msg.m_bFirstTick);
+			aConcat.Append("Last tick", msg.m_bLastTick);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, ServerPreClientUpdate)
+{
+	if(m_aEnableFrameDetailsConVar.Get() && CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CLogger::DetailedFormat("%s\n", __FUNCTION__);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, ServerGamePostSimulate)
+{
+	if(m_aEnableFrameDetailsConVar.Get() && CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer), 
+			                        aConcat2(&g_aEmbed2Concat, &sBuffer);
+
+			DumpEventSimulate(aConcat, aConcat2, msg);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, ClientGamePostSimulate)
+{
+	if(m_aEnableFrameDetailsConVar.Get() && CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer), 
+			                        aConcat2(&g_aEmbed2Concat, &sBuffer);
+
+			DumpEventSimulate(aConcat, aConcat2, msg);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, GameFrameBoundary)
+{
+	if(m_aEnableFrameDetailsConVar.Get() && m_aEnableFrameDetailsConVar.Get() && CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			DumpEventFrameBoundary(aConcat, msg);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, OutOfGameFrameBoundary)
+{
+	if(m_aEnableFrameDetailsConVar.Get() && CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+			DumpEventFrameBoundary(aConcat, msg);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, SaveGame)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer), 
+			                        aConcat2(&g_aEmbed2Concat, &sBuffer);
+
+			aConcat.Append("Entity list");
+			DumpEntityList(aConcat2, *msg.m_pEntityList);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+GS_EVENT_MEMBER(Sample_Plugin, RestoreGame)
+{
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(__FUNCTION__);
+
+		{
+			const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer), 
+			                        aConcat2(&g_aEmbed2Concat, &sBuffer);
+
+			aConcat.Append("Entity list");
+			DumpEntityList(aConcat2, *msg.m_pEntityList);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+void Sample_Plugin::FireGameEvent(IGameEvent *event)
+{
+	if(!m_aEnableGameEventsDetaillsConVar.Get())
+	{
+		return;
+	}
+
+	KeyValues3 *pEventDataKeys = event->GetDataKeys();
+
+	if(!pEventDataKeys)
+	{
+		CLogger::WarningFormat("Data keys is empty at \"%s\" event\n", event->GetName());
+
+		return;
+	}
+
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		int nMemberCount = pEventDataKeys->GetMemberCount();
+
+		if(!nMemberCount)
+		{
+			CLogger::WarningFormat("No members at \"%s\" event\n", event->GetName());
+
+			return;
+		}
+
+		{
+			auto aDetails = CLogger::CreateDetailsScope();
+
+			aDetails.PushFormat("\"%s\":", event->GetName());
+			aDetails.Push("{");
+
+			KV3MemberId_t i = 0;
+
+			do
+			{
+				const char *pEventMemberName = pEventDataKeys->GetMemberName(i);
+
+				KeyValues3 *pEventMember = pEventDataKeys->GetMember(i);
+
+				CBufferStringN<128> sEventMember;
+
+				pEventMember->ToString(sEventMember, KV3_TO_STRING_DONT_CLEAR_BUFF);
+				aDetails.PushFormat("\t\"%s\":\t%s", pEventMemberName, sEventMember.Get());
+
+				i++;
+			}
+			while(i < nMemberCount);
+
+			aDetails.Push("}");
+			aDetails.Send([&](const CUtlString &sBuffer)
+			{
+				CLogger::Detailed(sBuffer);
+			});
+		}
+	}
+}
+
+bool Sample_Plugin::InitPathResolver(char *error, size_t maxlen)
+{
+	if(!CPathResolver::Init(this))
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to initialize a path resolver", maxlen);
+		}
+
+		return false;
+	}
+
+	m_sBaseGameDirectory = CPathResolver::Extract();
+
+	return true;
+}
+
+bool Sample_Plugin::ClearPathResolver(char *error, size_t maxlen)
+{
+	// ...
+
+	return true;
+}
+
+bool Sample_Plugin::InitProvider(char *error, size_t maxlen)
+{
+	Provider::CStringVector vecMessages;
+
+	bool bResult = Provider::Init(vecMessages);
+
+	if(vecMessages.Count())
+	{
+		if(CLogger::IsChannelEnabled(LS_WARNING))
+		{
+			auto aWarnings = CLogger::CreateWarningsScope();
+
+			FOR_EACH_VEC(vecMessages, i)
+			{
+				auto &aMessage = vecMessages[i];
+
+				aWarnings.Push(aMessage.Get());
+			}
+
+			aWarnings.SendColor([&](Color rgba, const CUtlString &sContext)
+			{
+				CLogger::Warning(rgba, sContext);
+			});
+		}
+	}
+
+	if(!bResult)
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to initialize provider. See warnings", maxlen);
+		}
+	}
+
+	return bResult;
+}
+
+bool Sample_Plugin::LoadProvider(char *error, size_t maxlen)
+{
+	Provider::CStringVector vecMessages;
+
+	bool bResult = Provider::Load(m_sBaseGameDirectory.c_str(), SAMPLE_BASE_PATHID, vecMessages);
+
+	if(vecMessages.Count())
+	{
+		if(CLogger::IsChannelEnabled(LS_WARNING))
+		{
+			auto aWarnings = CLogger::CreateWarningsScope();
+
+			FOR_EACH_VEC(vecMessages, i)
+			{
+				auto &aMessage = vecMessages[i];
+
+				aWarnings.Push(aMessage);
+			}
+
+			aWarnings.SendColor([&](Color rgba, const CUtlString &sContext)
+			{
+				CLogger::Warning(rgba, sContext);
+			});
+		}
+	}
+
+	if(!bResult)
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to load provider. See warnings", maxlen);
+		}
+	}
+
+	return bResult;
+}
+
+bool Sample_Plugin::UnloadProvider(char *error, size_t maxlen)
+{
+	Provider::CStringVector vecMessages;
+
+	bool bResult = Provider::Destroy(vecMessages);
+
+	if(vecMessages.Count())
+	{
+		if(CLogger::IsChannelEnabled(LS_WARNING))
+		{
+			auto aWarnings = CLogger::CreateWarningsScope();
+
+			FOR_EACH_VEC(vecMessages, i)
+			{
+				auto &aMessage = vecMessages[i];
+
+				aWarnings.Push(aMessage);
+			}
+
+			aWarnings.SendColor([&](Color rgba, const CUtlString &sContext)
+			{
+				CLogger::Warning(rgba, sContext);
+			});
+		}
+	}
+
+	if(!bResult)
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to unload provider. See warnings", maxlen);
+		}
+	}
+
+	return bResult;
+}
+
+bool Sample_Plugin::RegisterGameResource(char *error, size_t maxlen)
+{
+	CGameEntitySystem **pGameEntitySystem = GetGameEntitySystemPointer();
+
+	if(!pGameEntitySystem)
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to get a game entity system", maxlen);
+		}
+	}
+
+	if(!RegisterGameEntitySystem(*pGameEntitySystem))
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to register a (game) entity system", maxlen);
+		}
+
+		return false;
+	}
+
+	return true;
+}
+
+bool Sample_Plugin::UnregisterGameResource(char *error, size_t maxlen)
+{
+	if(!UnregisterGameEntitySystem())
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to unregister a (game) entity system", maxlen);
+		}
+
+		return false;
+	}
+
+	return true;
+}
+
+bool Sample_Plugin::RegisterGameFactory(char *error, size_t maxlen)
+{
+	CBaseGameSystemFactory **ppFactory = GetFirstGameSystemPointer();
+
+	if(!ppFactory)
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to get a first game system factory", maxlen);
+		}
+
+		return false;
+	}
+
+	if(!RegisterFirstGameSystem(ppFactory))
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to register a first game factory", maxlen);
+		}
+
+		return false;
+	}
+
+	m_pFactory = new CGameSystemStaticFactory<Sample_Plugin>(GetName(), static_cast<Sample_Plugin *>(this), &g_pSamplePlugin);
+
+	return true;
+}
+
+bool Sample_Plugin::UnregisterGameFactory(char *error, size_t maxlen)
+{
+	if(m_pFactory)
+	{
+		m_pFactory->Shutdown();
+
+		auto *pGameSystem = m_pFactory->GetStaticGameSystem();
+
+		// Clean up smart dispatcher listener callbacks.
+		{
+			auto **ppDispatcher = GetGameSystemEventDispatcherPointer();
+
+			Assert(ppDispatcher);
+
+			auto *pDispatcher = *ppDispatcher;
+
+			Assert(pDispatcher);
+
+			pDispatcher->UnregisterListener(pGameSystem);
+		}
+
+		// Clean up the added game system.
+		{
+			auto *pGameSystemFactories = GetGameSystemFactoriesPointer();
+
+			Assert(pGameSystemFactories);
+
+			pGameSystemFactories->FindAndRemove(pGameSystem->GetName());
+		}
+
+		// Clean up the game systems.
+		{
+			auto *pGameSystems = GetGameSystemsPointer();
+
+			Assert(pGameSystems);
+
+			auto &vecGameSystems = *pGameSystems;
+
+			FOR_EACH_VEC_BACK(vecGameSystems, i)
+			{
+				if(pGameSystem == vecGameSystems[i].m_pGameSystem)
+				{
+					vecGameSystems.FastRemove(i);
+
+					break;
+				}
+			}
+		}
+
+		m_pFactory->DestroyGameSystem(this);
+		m_pFactory->Destroy();
+	}
+
+	if(!UnregisterFirstGameSystem())
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to unregister a first game factory", maxlen);
+		}
+
+		return false;
+	}
+
+	return true;
+}
+
+bool Sample_Plugin::RegisterSource2Server(char *error, size_t maxlen)
+{
+	IGameEventManager2 **ppGameEventManager = GetGameEventManagerPointer();
+
+	if(!ppGameEventManager)
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to get a game event manager", maxlen);
+		}
+
+		return false;
+	}
+
+	if(!RegisterGameEventManager(*ppGameEventManager))
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to register a game event manager", maxlen);
+		}
+
+		return false;
+	}
+
+	return true;
+}
+
+bool Sample_Plugin::UnregisterSource2Server(char *error, size_t maxlen)
+{
+	if(!UnregisterGameEventManager())
+	{
+		if(error && maxlen)
+		{
+			strncpy(error, "Failed to register a game event manager", maxlen);
+		}
+
+		return false;
+	}
+
+	return true;
+}
+
+bool Sample_Plugin::RegisterNetMessages(char *error, size_t maxlen)
+{
+	const struct
+	{
+		const char *pszName;
+		INetworkMessageInternal **ppInternal;
+	} aMessageInitializers[] =
+	{
+		{
+			"CSVCMsg_GetCvarValue",
+			&m_pGetCvarValueMessage,
+		},
+		{
+			"CUserMessageSayText2",
+			&m_pSayText2Message,
+		},
+		{
+			"CUserMessageTextMsg",
+			&m_pTextMsgMessage,
+		},
+	};
+
+	for(const auto &aMessageInitializer : aMessageInitializers)
+	{
+		const char *pszMessageName = aMessageInitializer.pszName;
+
+		INetworkMessageInternal *pMessage = g_pNetworkMessages->FindNetworkMessagePartial(pszMessageName);
+
+		if(!pMessage)
+		{
+			if(error && maxlen)
+			{
+				snprintf(error, maxlen, "Failed to get \"%s\" message", pszMessageName);
+			}
+
+			return false;
+		}
+
+		*aMessageInitializer.ppInternal = pMessage;
+	}
+
+	return true;
+}
+
+bool Sample_Plugin::UnregisterNetMessages(char *error, size_t maxlen)
+{
+	m_pSayText2Message = NULL;
+
+	return true;
+}
+
+bool Sample_Plugin::ParseLanguages(char *error, size_t maxlen)
+{
+	std::string sTranslationsFilesPath = m_sBaseGameDirectory + CORRECT_PATH_SEPARATOR_S SAMPLE_GAME_LANGUAGES_FILES;
+
+	const char *pszPathID = SAMPLE_BASE_PATHID, 
+	           *pszLanguagesFiles = sTranslationsFilesPath.c_str();
+
+	CUtlVector<CUtlString> vecLangugesFiles(0, 1);
+	CUtlVector<CUtlString> vecSubmessages;
+
+	CUtlString sBuffer;
+
+	auto aWarnings = CLogger::CreateWarningsScope();
+
+	AnyConfig::CLoadFromFile_General aLoadPresets({{&sBuffer, NULL, pszPathID}, g_KV3Format_Generic});
+
+	g_pFullFileSystem->FindFileAbsoluteList(vecLangugesFiles, pszLanguagesFiles, pszPathID);
+
+	if(!vecLangugesFiles.Count())
+	{
+		if(error && maxlen)
+		{
+			snprintf(error, maxlen, "No found languages by \"%s\" path", pszLanguagesFiles);
+		}
+
+		return false;
+	}
+
+	for(const auto &sFile : vecLangugesFiles)
+	{
+		const char *pszFilename = sFile.Get();
+
+		AnyConfig::Anyone aLanguagesConfig;
+
+		aLoadPresets.m_pszFilename = pszFilename;
+
+		if(!aLanguagesConfig.Load(aLoadPresets))
+		{
+			aWarnings.PushFormat("\"%s\": %s", pszFilename, sBuffer.Get());
+
+			continue;
+		}
+
+		if(!ParseLanguages(aLanguagesConfig.Get(), vecSubmessages))
+		{
+			aWarnings.PushFormat("\"%s\"", pszFilename);
+
+			for(const auto &sSubmessage : vecSubmessages)
+			{
+				aWarnings.PushFormat("\t%s", sSubmessage.Get());
+			}
+
+			continue;
+		}
+	}
+
+	if(aWarnings.Count())
+	{
+		aWarnings.Send([&](const CUtlString &sBuffer)
+		{
+			CLogger::Warning(sBuffer);
+		});
+	}
+
+	return true;
+}
+
+bool Sample_Plugin::ParseLanguages(KeyValues3 *pRoot, CUtlVector<CUtlString> &vecMessages)
+{
+	int nMemberCount = pRoot->GetMemberCount();
+
+	if(!nMemberCount)
+	{
+		vecMessages.AddToTail("No members");
+
+		return true;
+	}
+
+	const KeyValues3 *pDefaultData = pRoot->FindMember("default");
+
+	const char *pszServerContryCode = pDefaultData ? pDefaultData->GetString() : "en";
+
+	m_aServerLanguage.SetCountryCode(pszServerContryCode);
+
+	KV3MemberId_t i = 0;
+
+	do
+	{
+		const char *pszMemberName = pRoot->GetMemberName(i);
+
+		auto sMemberSymbol = GetLanguageSymbol(pszMemberName);
+
+		const KeyValues3 *pMember = pRoot->GetMember(i);
+
+		const char *pszMemberValue = pMember->GetString(pszServerContryCode);
+
+		m_mapLanguages.Insert(sMemberSymbol, {sMemberSymbol, pszMemberValue});
+
+		i++;
+	}
+	while(i < nMemberCount);
+
+	return true;
+}
+
+bool Sample_Plugin::ClearLanguages(char *error, size_t maxlen)
+{
+	m_vecLanguages.Purge();
+
+	return true;
+}
+
+bool Sample_Plugin::ParseTranslations(char *error, size_t maxlen)
+{
+	std::string sTranslationsFilesPath = m_sBaseGameDirectory + CORRECT_PATH_SEPARATOR_S SAMPLE_GAME_TRANSLATIONS_FILES;
+
+	const char *pszPathID = SAMPLE_BASE_PATHID, 
+	           *pszTranslationsFiles = sTranslationsFilesPath.c_str();
+
+	CUtlVector<CUtlString> vecTranslationsFiles(0, 1);
+
+	Translations::CStringVector vecSubmessages;
+
+	CUtlString sBuffer;
+
+	auto aWarnings = CLogger::CreateWarningsScope();
+
+	AnyConfig::CLoadFromFile_General aLoadPresets({{&sBuffer, NULL, pszPathID}, g_KV3Format_Generic});
+
+	g_pFullFileSystem->FindFileAbsoluteList(vecTranslationsFiles, pszTranslationsFiles, pszPathID);
+
+	if(!vecTranslationsFiles.Count())
+	{
+		if(error && maxlen)
+		{
+			snprintf(error, maxlen, "No found translations by \"%s\" path", pszTranslationsFiles);
+		}
+
+		return false;
+	}
+
+	for(const auto &sFile : vecTranslationsFiles)
+	{
+		const char *pszFilename = sFile.Get();
+
+		AnyConfig::Anyone aTranslationsConfig;
+
+		aLoadPresets.m_pszFilename = pszFilename;
+
+		if(!aTranslationsConfig.Load(aLoadPresets))
+		{
+			aWarnings.PushFormat("\"%s\": %s", pszFilename, sBuffer.Get());
+
+			continue;
+		}
+
+		if(!Translations::Parse(aTranslationsConfig.Get(), static_cast<Translations::IPhraseReplacer *>(this), vecSubmessages))
+		{
+			aWarnings.PushFormat("\"%s\"", pszFilename);
+
+			for(const auto &sSubmessage : vecSubmessages)
+			{
+				aWarnings.PushFormat("\t%s", sSubmessage.Get());
+			}
+
+			continue;
+		}
+	}
+
+	if(aWarnings.Count())
+	{
+		aWarnings.Send([&](const CUtlString &sBuffer)
+		{
+			CLogger::Warning(sBuffer);
+		});
+	}
+
+	return true;
+}
+
+bool Sample_Plugin::ClearTranslations(char *error, size_t maxlen)
+{
+	Translations::Purge();
+
+	return true;
+}
+
+bool Sample_Plugin::ParseGameEvents()
+{
+	const char *pszPathID = SAMPLE_BASE_PATHID;
+
+	CUtlVector<CUtlString> vecGameEventFiles(0, 1);
+
+	CUtlVector<CUtlString> vecSubmessages;
+
+	CUtlString sBuffer;
+
+	auto aWarnings = CLogger::CreateWarningsScope();
+
+	AnyConfig::CLoadFromFile_General aLoadPresets({{&sBuffer, NULL, pszPathID}, g_KV3Format_Generic});
+
+	g_pFullFileSystem->FindFileAbsoluteList(vecGameEventFiles, SAMPLE_GAME_EVENTS_FILES, pszPathID);
+
+	for(const auto &sFile : vecGameEventFiles)
+	{
+		const char *pszFilename = sFile.Get();
+
+		AnyConfig::Anyone aGameEventConfig;
+
+		aLoadPresets.m_pszFilename = pszFilename;
+
+		if(!aGameEventConfig.Load(aLoadPresets))
+		{
+			aWarnings.PushFormat("\"%s\": %s", pszFilename, sBuffer.Get());
+
+			continue;
+		}
+
+		if(!ParseGameEvents(aGameEventConfig.Get(), vecSubmessages))
+		{
+			aWarnings.PushFormat("\"%s\":", pszFilename);
+
+			for(const auto &sSubmessage : vecSubmessages)
+			{
+				aWarnings.PushFormat("\t%s", sSubmessage.Get());
+			}
+
+			continue;
+		}
+
+		// ...
+	}
+
+	if(aWarnings.Count())
+	{
+		aWarnings.Send([&](const CUtlString &sBuffer)
+		{
+			CLogger::Warning(sBuffer);
+		});
+	}
+
+	return true;
+}
+
+bool Sample_Plugin::ParseGameEvents(KeyValues3 *pData, CUtlVector<CUtlString> &vecMessages)
+{
+	int nMemberCount = pData->GetMemberCount();
+
+	if(!nMemberCount)
+	{
+		vecMessages.AddToTail("No members");
+
+		return false;
+	}
+
+	CUtlString sBuffer;
+
+	KV3MemberId_t i = 0;
+
+	do
+	{
+		const char *pszEvent = pData->GetMemberName(i);
+
+		if(!pszEvent)
+		{
+			sBuffer.Format("No member name at #%d", i);
+			vecMessages.AddToTail(sBuffer);
+
+			continue;
+		}
+
+		m_vecGameEvents.AddToTail(pszEvent);
+
+		i++;
+	}
+	while(i < nMemberCount);
+
+	return true;
+}
+
+bool Sample_Plugin::ClearGameEvents()
+{
+	m_vecGameEvents.Purge();
+
+	return true;
+}
+
+bool Sample_Plugin::HookGameEvents()
+{
+	auto aWarnings = CLogger::CreateWarningsScope();
+
+	static const char *pszWarningFormat = "Failed to hook \"%s\" event";
+
+	for(const auto &sEvent : m_vecGameEvents)
+	{
+		const char *pszEvent = sEvent.Get();
+
+		if(g_pGameEventManager->AddListener(this, pszEvent, true) == -1)
+		{
+			aWarnings.PushFormat(pszWarningFormat, pszEvent);
+
+			continue;
+		}
+
+#ifdef DEBUG
+		CLogger::DetailedFormat("Hooked \"%s\" event\n", pszEvent);
+#endif
+	}
+
+	if(aWarnings.Count())
+	{
+		aWarnings.Send([&](const CUtlString &sBuffer)
+		{
+			CLogger::Warning(sBuffer);
+		});
+	}
+
+	return true;
+}
+
+bool Sample_Plugin::UnhookGameEvents()
+{
+	if(g_pGameEventManager)
+	{
+		g_pGameEventManager->RemoveListener(this);
+	}
+
+	return true;
+}
+
+void Sample_Plugin::OnReloadGameDataCommand(const CCommandContext &context, const CCommand &args)
+{
+	char error[256];
+
+	if(!LoadProvider(error, sizeof(error)))
+	{
+		CLogger::WarningFormat("%s\n", error);
+	}
+}
+
+void Sample_Plugin::OnDispatchConCommandHook(ConCommandRef hCommand, const CCommandContext &aContext, const CCommand &aArgs)
+{
+	if(CLogger::IsChannelEnabled(LV_DETAILED))
+	{
+		CLogger::DetailedFormat("%s(%d, %d, %s)\n", __FUNCTION__, hCommand.GetAccessIndex(), aContext.GetPlayerSlot().Get(), aArgs.GetCommandString());
+	}
+
+	auto aPlayerSlot = aContext.GetPlayerSlot();
+
+	const char *pszArg0 = aArgs.Arg(0);
+
+	static const char szSayCommand[] = "say";
+
+	size_t nSayNullTerminated = sizeof(szSayCommand) - 1;
+
+	if(!V_strncmp(pszArg0, (const char *)szSayCommand, nSayNullTerminated))
+	{
+		if(!pszArg0[nSayNullTerminated] || !V_strcmp(&pszArg0[nSayNullTerminated], "_team"))
+		{
+			const char *pszArg1 = aArgs.Arg(1);
+
+			// Skip spaces.
+			while(*pszArg1 == ' ')
+			{
+				pszArg1++;
+			}
+
+			bool bIsSilent = *pszArg1 == Sample::ChatCommandSystem::GetSilentTrigger();
+
+			if(bIsSilent || *pszArg1 == Sample::ChatCommandSystem::GetPublicTrigger())
+			{
+				pszArg1++; // Skip a command character.
+
+				// Print a chat message before.
+				if(!bIsSilent && g_pCVar)
+				{
+					SH_CALL(g_pCVar, &ICvar::DispatchConCommand)(hCommand, aContext, aArgs);
+				}
+
+				// Call the handler.
+				{
+					size_t nArg1Length = 0;
+
+					// Get a length to a first space.
+					while(pszArg1[nArg1Length] && pszArg1[nArg1Length] != ' ')
+					{
+						nArg1Length++;
+					}
+
+					CUtlVector<CUtlString> vecArgs;
+
+					V_SplitString(pszArg1, " ", vecArgs);
+
+					for(auto &sArg : vecArgs)
+					{
+						sArg.Trim(' ');
+					}
+
+					if(CLogger::IsChannelEnabled(LV_DETAILED))
+					{
+						CMassiveBufferString sBuffer;
+
+						const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer), 
+						                        aConcat2(&g_aEmbed2Concat, &sBuffer);
+
+						CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append("Handling chat command");
+						aConcat.Append("Player slot", aPlayerSlot.Get());
+						aConcat.Append("Is silent", bIsSilent);
+						aConcat.Append("Arguments");
+
+						for(const auto &sArg : vecArgs)
+						{
+							aConcat2.Append<false, true>(sArg.Get());
+						}
+
+						CLogger::Detailed(sBuffer);
+					}
+
+					Sample::ChatCommandSystem::Handle(aPlayerSlot, bIsSilent, vecArgs);
+				}
+
+				RETURN_META(MRES_SUPERCEDE);
+			}
+		}
+	}
+
+	RETURN_META(MRES_IGNORED);
+}
+
+void Sample_Plugin::OnStartupServerHook(const GameSessionConfiguration_t &config, ISource2WorldSession *pWorldSession, const char *)
+{
+	auto *pNetServer = reinterpret_cast<CNetworkGameServerBase *>(g_pNetworkServerService->GetIGameServer());
+
+	OnStartupServer(pNetServer, config, pWorldSession);
+
+	RETURN_META(MRES_IGNORED);
+}
+
+CServerSideClientBase *Sample_Plugin::OnConnectClientHook(const char *pszName, ns_address *pAddr, uint32 hSocket, const C2S_CONNECT_Message &msg, 
+                                                          const char *pszDecryptedPassword, const byte *pAuthTicket, int nAuthTicketLength, bool bIsLowViolence)
+{
+	auto *pNetServer = META_IFACEPTR(CNetworkGameServerBase);
+
+	auto *pClient = META_RESULT_ORIG_RET(CServerSideClientBase *);
+
+	if(CLogger::IsChannelEnabled(LV_DEFAULT))
+	{
+		CBufferStringN<2048> sBuffer;
+
+		const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer), 
+		                        aConcat2(&g_aEmbed2Concat, &sBuffer);
+
+		if(hSocket)
+		{
+			aConcat.Append("Socket", hSocket);
+		}
+
+		aConcat.Append("Connect message", DumpProtobufMessage(&g_aEmbed2Concat, msg).Get());
+
+		if(pszDecryptedPassword)
+		{
+			aConcat.Append<false, true>("Attempt password", pszDecryptedPassword);
+		}
+
+		if(pAuthTicket && nAuthTicketLength)
+		{
+			aConcat.AppendBytes("Auth ticket", pAuthTicket, nAuthTicketLength);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+
+	OnConnectClient(pNetServer, pClient);
+
+	RETURN_META_VALUE(MRES_IGNORED, NULL);
+}
+
+bool Sample_Plugin::OnProcessRespondCvarValueHook(const CCLCMsg_RespondCvarValue_t &aMessage)
+{
+	auto *pClient = META_IFACEPTR(CServerSideClientBase);
+
+	OnProcessRespondCvarValue(pClient, aMessage);
+
+	RETURN_META_VALUE(MRES_IGNORED, true);
+}
+
+void Sample_Plugin::OnDisconectClientHook(ENetworkDisconnectionReason eReason)
+{
+	auto *pClient = META_IFACEPTR(CServerSideClientBase);
+
+	OnDisconectClient(pClient, eReason);
+
+	RETURN_META(MRES_IGNORED);
+}
+
+CMassiveBufferString Sample_Plugin::DumpProtobufMessage(const CConcatLineString *pConcat, const google::protobuf::Message &msg)
+{
+	CMassiveBufferString sResult;
+
+	try
+	{
+		const char *pszEnds = pConcat->GetEnds(), 
+		           *pszEndsAndStartsWith = pConcat->GetEndsAndStartsWith();
+
+		auto sBufferData = msg.DebugString();
+
+		sResult.Set(sBufferData.c_str(), sBufferData.length());
+		sResult.Replace(pszEnds, pszEndsAndStartsWith);
+
+		int nNewLength = sResult.Length() - V_strlen(pszEndsAndStartsWith);
+
+		// Strip the last next line, leaving the end.
+		if(nNewLength >= 0)
+		{
+			sResult.SetLength(nNewLength);
+		}
+
+		sResult.Insert(0, pszEndsAndStartsWith);
+	}
+	catch(const std::exception &error)
+	{
+		sResult.Set(error.what(), -1);
+	}
+
+	return sResult;
+}
+
+void Sample_Plugin::DumpEngineLoopState(const CConcatLineBuffer &aConcat, const EngineLoopState_t &aMessage)
+{
+	aConcat.Append("Window handle", reinterpret_cast<void *>(aMessage.m_hWnd));
+	aConcat.Append("Swap chain handle", reinterpret_cast<void *>(aMessage.m_hSwapChain));
+	aConcat.Append("Input context handle", reinterpret_cast<void *>(aMessage.m_hInputContext));
+	aConcat.Append("Window width", aMessage.m_nPlatWindowWidth);
+	aConcat.Append("Window height", aMessage.m_nPlatWindowHeight);
+	aConcat.Append("Render width", aMessage.m_nRenderWidth);
+	aConcat.Append("Render height", aMessage.m_nRenderHeight);
+}
+
+void Sample_Plugin::DumpEntityList(const CConcatLineBuffer &aConcat, const CUtlVector<CEntityHandle> &vecEntityList)
+{
+	for(const auto &it : vecEntityList)
+	{
+		aConcat.Append(it.Get()->GetClassname(), it.GetEntryIndex());
+	}
+}
+
+void Sample_Plugin::DumpEventSimulate(const CConcatLineBuffer &aConcat, const CConcatLineBuffer &aConcat2, const EventSimulate_t &aMessage)
+{
+	aConcat.Append("Loop state");
+	DumpEngineLoopState(aConcat2, aMessage.m_LoopState);
+	aConcat.Append("First tick", aMessage.m_bFirstTick);
+	aConcat.Append("Last tick", aMessage.m_bLastTick);
+}
+
+void Sample_Plugin::DumpEventFrameBoundary(const CConcatLineBuffer &aConcat, const EventFrameBoundary_t &aMessage)
+{
+	aConcat.Append("Frame time", aMessage.m_flFrameTime);
+}
+
+void Sample_Plugin::DumpServerSideClient(const CConcatLineBuffer &aConcat, CServerSideClientBase *pClient)
+{
+	aConcat.Append<false, true>("Name", pClient->GetClientName());
+	aConcat.Append("Player slot", pClient->GetPlayerSlot().Get());
+	aConcat.Append("Entity index", pClient->GetEntityIndex().Get());
+	aConcat.Append("UserID", pClient->GetUserID().Get());
+	aConcat.Append("Signon state", static_cast<int>(pClient->GetSignonState()));
+	aConcat.Append("SteamID", pClient->GetClientSteamID().Render());
+	aConcat.Append("Is fake", pClient->IsFakeClient());
+
+	{
+		const netadr_t *pRemoteAddress = pClient->GetRemoteAddress();
+
+		aConcat.Append("Address", pRemoteAddress ? pRemoteAddress->ToString() : "<none>");
+	}
+
+	aConcat.Append("Low violence", pClient->IsLowViolenceClient());
+	aConcat.Append("Is fully authenticated", pClient->IsFullyAuthenticated());
+}
+
+void Sample_Plugin::DumpDisconnectReason(const CConcatLineBuffer &aConcat, ENetworkDisconnectionReason eReason)
+{
+	aConcat.Append("Disconnect reason", (int)eReason);
+}
+
+void Sample_Plugin::SendCvarValueQuery(IRecipientFilter *pFilter, const char *pszName, int iCookie)
+{
+	auto *pGetCvarValueMessage = m_pGetCvarValueMessage;
+
+	if(CLogger::IsChannelEnabled(LV_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+		sBuffer.Format("Send get cvar message (%s):\n", pGetCvarValueMessage->GetUnscopedName());
+		aConcat.Append<false, true>("Cvar name", pszName);
+		aConcat.Append("Cookie", iCookie);
+
+		CLogger::Detailed(sBuffer);
+	}
+
+	auto *pMessage = pGetCvarValueMessage->AllocateMessage()->As<CSVCMsg_GetCvarValue_t>();
+
+	pMessage->set_cvar_name(pszName);
+	pMessage->set_cookie(iCookie);
+
+	g_pGameEventSystem->PostEventAbstract(-1, false, pFilter, pGetCvarValueMessage, pMessage, 0);
+
+	delete pMessage;
+}
+
+void Sample_Plugin::SendChatMessage(IRecipientFilter *pFilter, int iEntityIndex, bool bIsChat, const char *pszChatMessageFormat, const char *pszParam1, const char *pszParam2, const char *pszParam3, const char *pszParam4)
+{
+	auto *pSayText2Message = m_pSayText2Message;
+
+	if(CLogger::IsChannelEnabled(LV_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+		sBuffer.Format("Send chat message (%s):\n", pSayText2Message->GetUnscopedName());
+		aConcat.Append("Entity index", iEntityIndex);
+		aConcat.Append("Is chat", bIsChat);
+		aConcat.Append<false, true>("Chat message", pszChatMessageFormat);
+
+		if(pszParam1 && *pszParam1)
+		{
+			aConcat.Append<false, true>("Parameter #1", pszParam1);
+		}
+
+		if(pszParam2 && *pszParam2)
+		{
+			aConcat.Append<false, true>("Parameter #2", pszParam2);
+		}
+
+		if(pszParam3 && *pszParam3)
+		{
+			aConcat.Append<false, true>("Parameter #3", pszParam3);
+		}
+
+		if(pszParam4 && *pszParam4)
+		{
+			aConcat.Append<false, true>("Parameter #4", pszParam4);
+		}
+
+		CLogger::Detailed(sBuffer);
+	}
+
+	auto *pMessage = pSayText2Message->AllocateMessage()->As<CUserMessageSayText2_t>();
+
+	pMessage->set_entityindex(iEntityIndex);
+	pMessage->set_chat(bIsChat);
+	pMessage->set_messagename(pszChatMessageFormat);
+	pMessage->set_param1(pszParam1);
+	pMessage->set_param2(pszParam2);
+	pMessage->set_param3(pszParam3);
+	pMessage->set_param4(pszParam4);
+
+	g_pGameEventSystem->PostEventAbstract(-1, false, pFilter, pSayText2Message, pMessage, 0);
+
+	delete pMessage;
+}
+
+void Sample_Plugin::SendTextMessage(IRecipientFilter *pFilter, int iDestination, size_t nParamCount, const char *pszParam, ...)
+{
+	auto *pTextMsg = m_pTextMsgMessage;
+
+	if(CLogger::IsChannelEnabled(LV_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append(pTextMsg->GetUnscopedName());
+		aConcat.Append("Destination", iDestination);
+		aConcat.Append("Parameter", pszParam);
+		CLogger::Detailed(sBuffer);
+	}
+
+	auto *pMessage = pTextMsg->AllocateMessage()->As<CUserMessageTextMsg_t>();
+
+	pMessage->set_dest(iDestination);
+	pMessage->add_param(pszParam);
+	nParamCount--;
+
+	// Parse incoming parameters.
+	if(0 < nParamCount)
+	{
+		va_list aParams;
+
+		va_start(aParams, pszParam);
+
+		size_t n = 0;
+
+		do
+		{
+			pMessage->add_param(va_arg(aParams, const char *));
+
+			n++;
+		}
+		while(n < nParamCount);
+
+		va_end(aParams);
+	}
+
+	g_pGameEventSystem->PostEventAbstract(-1, false, pFilter, pTextMsg, pMessage, 0);
+
+	delete pMessage;
+}
+
+void Sample_Plugin::OnStartupServer(CNetworkGameServerBase *pNetServer, const GameSessionConfiguration_t &config, ISource2WorldSession *pWorldSession)
+{
+	SH_ADD_HOOK_MEMFUNC(CNetworkGameServerBase, ConnectClient, pNetServer, this, &Sample_Plugin::OnConnectClientHook, true);
+
+	// Initialize & hook game evetns.
+	// Initialize network messages.
+	{
+		char sBuffer[256];
+
+		if(RegisterSource2Server(sBuffer, sizeof(sBuffer)))
+		{
+			HookGameEvents();
+		}
+		else
+		{
+			CLogger::WarningFormat("%s\n", sBuffer);
+		}
+
+		if(!RegisterNetMessages(sBuffer, sizeof(sBuffer)))
+		{
+			CLogger::WarningFormat("%s\n", sBuffer);
+		}
+	}
+
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+		sBuffer.Format("Receive %s message:", config.GetTypeName().c_str());
+		sBuffer.Append(DumpProtobufMessage(&g_aEmbedConcat, config).Get());
+
+		sBuffer.AppendFormat("Register globals:\n");
+		DumpRegisterGlobals(aConcat);
+
+		CLogger::Detailed(sBuffer);
+	}
+}
+
+void Sample_Plugin::OnConnectClient(CNetworkGameServerBase *pNetServer, CServerSideClientBase *pClient)
+{
+	if(pClient)
+	{
+		SH_ADD_HOOK_MEMFUNC(CServerSideClientBase, ProcessRespondCvarValue, pClient, this, &Sample_Plugin::OnProcessRespondCvarValueHook, false);
+
+		if(pClient->IsFakeClient())
+		{
+			return;
+		}
+
+		SH_ADD_HOOK_MEMFUNC(CServerSideClientBase, PerformDisconnection, pClient, this, &Sample_Plugin::OnDisconectClientHook, false);
+	}
+	else
+	{
+		AssertMsg(0, "Failed to get a server side client pointer\n");
+
+		return;
+	}
+
+	if(CLogger::IsChannelEnabled(LS_DETAILED) && pClient)
+	{
+		CMassiveBufferString sBuffer;
+
+		const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer), 
+		                        aConcat2(&g_aEmbed2Concat, &sBuffer);
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append("Connected client");
+		DumpServerSideClient(aConcat, pClient);
+
+		CLogger::Detailed(sBuffer);
+	}
+
+	if(!pClient)
+	{
+		return;
+	}
+
+	auto *pPlayer = reinterpret_cast<CServerSideClient *>(pClient);
+
+	auto aSlot = pClient->GetPlayerSlot();
+
+	auto &aPlayer = GetPlayerData(aSlot);
+
+	// Get "cl_language" cvar value from a client.
+	{
+
+		CSingleRecipientFilter aFilter(aSlot);
+
+		const char *pszCvarName = SAMPLE_CLIENT_CVAR_NAME_LANGUAGE;
+
+		int iCookie {};
+
+		{
+			auto sConVarSymbol = GetConVarSymbol(pszCvarName);
+
+			auto iFound = m_mapConVarCookies.Find(sConVarSymbol);
+
+			if(m_mapConVarCookies.IsValidIndex(iFound))
+			{
+				auto &iFoundCookie = m_mapConVarCookies.Element(iFound);
+
+				iFoundCookie++;
+				iCookie = iFoundCookie;
+			}
+			else
+			{
+				iCookie = 0;
+				m_mapConVarCookies.Insert(sConVarSymbol, iCookie);
+			}
+		}
+
+		SendCvarValueQuery(&aFilter, pszCvarName, iCookie);
+	}
+
+	aPlayer.OnConnected(pPlayer);
+}
+
+bool Sample_Plugin::OnProcessRespondCvarValue(CServerSideClientBase *pClient, const CCLCMsg_RespondCvarValue_t &aMessage)
+{
+	auto sFoundSymbol = FindConVarSymbol(aMessage.name().c_str());
+
+	if(!sFoundSymbol.IsValid())
+	{
+		return false;
+	}
+
+	auto iFound = m_mapConVarCookies.Find(sFoundSymbol);
+
+	if(!m_mapConVarCookies.IsValidIndex(iFound))
+	{
+		return false;
+	}
+
+	const auto &itCookie = m_mapConVarCookies.Element(iFound);
+
+	if(itCookie != aMessage.cookie())
+	{
+		return false;
+	}
+
+	auto iLanguageFound = m_mapLanguages.Find(FindLanguageSymbol(aMessage.value().c_str()));
+
+	if(!m_mapLanguages.IsValidIndex(iLanguageFound))
+	{
+		return false;
+	}
+
+	auto aSlot = pClient->GetPlayerSlot();
+
+	auto &aPlayer = GetPlayerData(aSlot);
+
+	auto &itLanguage = m_mapLanguages.Element(iLanguageFound);
+
+	aPlayer.OnLanguageChanged(aSlot, &itLanguage);
+
+	{
+		CUtlVector<CUtlString> vecMessages;
+
+		auto aWarnings = CLogger::CreateWarningsScope();
+
+		aPlayer.TranslatePhrases(this, this->m_aServerLanguage, vecMessages);
+
+		for(const auto &sBuffer : vecMessages)
+		{
+			aWarnings.Push(sBuffer.Get());
+		}
+
+		aWarnings.SendColor([&](Color rgba, const CUtlString &sContext)
+		{
+			CLogger::Warning(rgba, sContext);
+		});
+	}
+
+	return true;
+}
+
+void Sample_Plugin::OnDisconectClient(CServerSideClientBase *pClient, ENetworkDisconnectionReason eReason)
+{
+	SH_REMOVE_HOOK_MEMFUNC(CServerSideClientBase, ProcessRespondCvarValue, pClient, this, &Sample_Plugin::OnProcessRespondCvarValueHook, false);
+
+	if(pClient->IsFakeClient())
+	{
+		return;
+	}
+
+	SH_REMOVE_HOOK_MEMFUNC(CServerSideClientBase, PerformDisconnection, pClient, this, &Sample_Plugin::OnDisconectClientHook, false);
+
+	if(CLogger::IsChannelEnabled(LS_DETAILED))
+	{
+		CMassiveBufferString sBuffer;
+
+		const CConcatLineBuffer aConcat(&g_aEmbedConcat, &sBuffer);
+
+		CConcatLineBuffer(&g_aRootConcat, &sBuffer).Append("Disconnect a client");
+		DumpServerSideClient(aConcat, pClient);
+		DumpDisconnectReason(aConcat, eReason);
+
+		CLogger::Detailed(sBuffer);
+	}
+
+	auto *pPlayer = reinterpret_cast<CServerSideClient *>(pClient);
+
+	auto aSlot = pClient->GetPlayerSlot();
+
+	auto &aPlayer = GetPlayerData(aSlot);
+
+	aPlayer.OnDisconnected(pPlayer, eReason);
+}
+
+CUtlSymbolLarge Sample_Plugin::GetConVarSymbol(const char *pszName)
+{
+	return m_tableConVars.AddString(pszName);
+}
+
+CUtlSymbolLarge Sample_Plugin::FindConVarSymbol(const char *pszName) const
+{
+	return m_tableConVars.Find(pszName);
+}
+
+CUtlSymbolLarge Sample_Plugin::GetLanguageSymbol(const char *pszName)
+{
+	return m_tableLanguages.AddString(pszName);
+}
+
+CUtlSymbolLarge Sample_Plugin::FindLanguageSymbol(const char *pszName) const
+{
+	return m_tableLanguages.Find(pszName);
+}

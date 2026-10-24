@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/metamod-source" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/metamod-source/hl2sdk-manifests" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/metamod-source/third_party/amtl" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/metamod-source/third_party/amtl/third_party/googletest" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/metamod-source/third_party/khook" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/metamod-source/third_party/khook/third_party/googletest" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/metamod-source/third_party/khook/third_party/gtest-parallel" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/metamod-source/third_party/khook/third_party/safetyhook" vcs="Git" />
+  </component>
+</project>
